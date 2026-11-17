@@ -25,11 +25,19 @@
   即可达集 S（π=1）没有选中边流出 ⇔ b 不可达 a ⇔ 不同轨迹。
 
 若 ILP 不可行（判断相互冲突），明确报告无解，不给出计数。
+
+冲突定位
+--------
+``locate_conflict`` 在判断条数不超过 8 条、且已确认无解时，用删除法求一个
+**最小不可行判断组**（MIS）：该组单独即不可行，删去组内任意一条则可行。
+每一次可行性检查都带时限；任何一次检查超时或出错都抛出 ``LocationIncomplete``，
+绝不猜测冲突。可行性只取决于身份判断，与代价参数无关。
 """
 
 from __future__ import annotations
 
 import math
+import time
 
 import numpy as np
 from scipy.optimize import Bounds, LinearConstraint, milp
@@ -39,9 +47,18 @@ from scipy.sparse import coo_matrix
 _STATUS_OPTIMAL = 0
 _STATUS_INFEASIBLE = 2
 
+# 冲突定位：条数上限、单次可行性检查时限、整次定位总时限（秒）
+MAX_LOCATE_JUDGMENTS = 8
+FEASIBILITY_TIME_LIMIT = 5.0
+LOCATE_TOTAL_TIME_LIMIT = 30.0
+
 
 class InputConflict(Exception):
     """输入层面即可判定的判断冲突（无需求解即可报告具体原因）。"""
+
+
+class LocationIncomplete(Exception):
+    """冲突定位时某次可行性检查超时或出错；应提示定位未完成，不猜测冲突。"""
 
 
 def _norm_box(d):
@@ -136,32 +153,16 @@ def _same_classes(n, judgments, frames, ids):
     return classes, diff_pairs
 
 
-def solve_tracking(detections, judgments, w_dist, w_app, penalty, time_limit=60.0):
-    """求全局最小关联。返回结果字典（含 feasible 标志）。
+def _build_model(detections, judgments, w_dist, w_app, penalty):
+    """构造 ILP 模型（与求解/可行性检查共用）。
 
-    detections: [{"id":..,"frame":int,"rect":[x,y,w,h],"vector":[...]}]
-    judgments:  [{"a":idx,"b":idx,"type":"same"|"different"}]（a、b 为 detections 下标）
+    返回字典，包含变量布局、约束矩阵、变量界限以及按关联代价构造的目标向量。
+    输入层面的显然冲突抛出 InputConflict。
     """
-    try:
-        return _solve_impl(detections, judgments, w_dist, w_app, penalty, time_limit)
-    except InputConflict as exc:
-        return {"feasible": False, "message": f"无解：{exc} 不提供动物计数。"}
-
-
-def _solve_impl(detections, judgments, w_dist, w_app, penalty, time_limit=60.0):
     n = len(detections)
     ids = [str(d["id"]) for d in detections]
     if n == 0:
-        return {
-            "feasible": True,
-            "message": "无检测框。",
-            "total_cost": 0.0,
-            "assoc_cost": 0.0,
-            "penalty_cost": 0.0,
-            "n_trajectories": 0,
-            "animal_count": 0,
-            "trajectories": [],
-        }
+        return {"n": 0, "ids": ids, "frames": [], "edges": [], "model": None}
 
     edges, frames = _build_edges(detections, w_dist, w_app)
     classes, diff_pairs = _same_classes(n, judgments, frames, ids)
@@ -259,26 +260,68 @@ def _solve_impl(detections, judgments, w_dist, w_app, penalty, time_limit=60.0):
     ).tocsr()
     constraints = LinearConstraint(A, np.array(lb_c), np.array(ub_c))
 
-    res = milp(
-        c=c,
-        constraints=constraints,
-        bounds=Bounds(lb, ub),
-        integrality=integrality,
+    return {
+        "n": n,
+        "ids": ids,
+        "frames": frames,
+        "edges": edges,
+        "model": {
+            "c": c,
+            "constraints": constraints,
+            "bounds": Bounds(lb, ub),
+            "integrality": integrality,
+            "off_x": off_x,
+            "off_s": off_s,
+        },
+    }
+
+
+def _run_milp(model, objective, time_limit):
+    return milp(
+        c=objective,
+        constraints=model["constraints"],
+        bounds=model["bounds"],
+        integrality=model["integrality"],
         options={"time_limit": float(time_limit), "mip_rel_gap": 0.0},
     )
+
+
+def _solve_impl(detections, judgments, w_dist, w_app, penalty, time_limit=60.0):
+    n = len(detections)
+    ids = [str(d["id"]) for d in detections]
+    if n == 0:
+        return {
+            "feasible": True,
+            "message": "无检测框。",
+            "total_cost": 0.0,
+            "assoc_cost": 0.0,
+            "penalty_cost": 0.0,
+            "n_trajectories": 0,
+            "animal_count": 0,
+            "trajectories": [],
+        }
+
+    built = _build_model(detections, judgments, w_dist, w_app, penalty)
+    edges = built["edges"]
+    frames = built["frames"]
+    mdl = built["model"]
+    res = _run_milp(mdl, mdl["c"], time_limit)
 
     if res.status == _STATUS_INFEASIBLE:
         return {
             "feasible": False,
+            "reason": "infeasible",
             "message": "约束不可满足：身份判断相互冲突（全局最优解不存在），不提供动物计数。",
         }
     if res.status != _STATUS_OPTIMAL or res.x is None:
         return {
             "feasible": False,
+            "reason": "solver_error",
             "message": f"求解未收敛到全局最优（求解器状态：{res.message}），不提供动物计数。",
         }
 
     x = res.x
+    off_x, off_s = mdl["off_x"], mdl["off_s"]
     succ = {}
     assoc_cost = 0.0
     for k, (i, j, cost) in enumerate(edges):
@@ -314,4 +357,138 @@ def _solve_impl(detections, judgments, w_dist, w_app, penalty, time_limit=60.0):
             }
             for traj in trajectories
         ],
+    }
+
+
+def solve_tracking(detections, judgments, w_dist, w_app, penalty, time_limit=60.0):
+    """求全局最小关联。返回结果字典（含 feasible 标志）。
+
+    detections: [{"id":..,"frame":int,"rect":[x,y,w,h],"vector":[...]}]
+    judgments:  [{"a":idx,"b":idx,"type":"same"|"different"}]（a、b 为 detections 下标）
+    """
+    try:
+        return _solve_impl(detections, judgments, w_dist, w_app, penalty, time_limit)
+    except InputConflict as exc:
+        return {
+            "feasible": False,
+            "reason": "infeasible",
+            "message": f"无解：{exc} 不提供动物计数。",
+        }
+
+
+def _check_feasible(detections, judgments, w_dist, w_app, penalty, time_limit):
+    """判断给定判断组合下是否**存在**可行关联。
+
+    返回 True/False。输入层面的显然冲突（InputConflict）是确定性不可行证明，
+    返回 False；求解器未在时限内给出结论或抛出其它异常时抛 LocationIncomplete，
+    绝不把“不知道”当成不可行。
+    """
+    try:
+        built = _build_model(detections, judgments, w_dist, w_app, penalty)
+    except InputConflict:
+        return False
+    if built["n"] == 0:
+        return True
+    mdl = built["model"]
+    zero = np.zeros_like(mdl["c"])
+    try:
+        res = _run_milp(mdl, zero, time_limit)
+    except Exception as exc:  # noqa: BLE001 - 定位必须显式报告未完成
+        raise LocationIncomplete(f"可行性检查出错：{exc}") from exc
+    if res.status == _STATUS_INFEASIBLE:
+        return False
+    if res.status == _STATUS_OPTIMAL and res.x is not None:
+        return True
+    raise LocationIncomplete(
+        f"可行性检查未完成（求解器状态：{res.message}）。"
+    )
+
+
+def locate_conflict(detections, judgments, w_dist, w_app, penalty,
+                    check_time_limit=FEASIBILITY_TIME_LIMIT,
+                    total_time_limit=LOCATE_TOTAL_TIME_LIMIT):
+    """定位一组导致无解的最小身份判断。
+
+    judgments 的 a/b 为 detections 下标；返回的 ``judgments`` 保持传入顺序中的
+    具体条目（子集）。成功后保证：
+    - 该子集单独即不可行；
+    - 删除子集中任意一条后即可行。
+    任何一次可行性检查超时/出错 → 返回 status="incomplete"，不猜测冲突。
+    """
+    if len(judgments) > MAX_LOCATE_JUDGMENTS:
+        return {
+            "status": "too_many",
+            "message": (
+                f"当前有 {len(judgments)} 条判断，超过 {MAX_LOCATE_JUDGMENTS} 条，"
+                "暂不提供冲突定位；仍可正常求解。"
+            ),
+            "limit": MAX_LOCATE_JUDGMENTS,
+        }
+
+    deadline = time.monotonic() + total_time_limit
+    checks = 0
+
+    def feasible(subset):
+        nonlocal checks
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LocationIncomplete("定位总时长已用尽。")
+        checks += 1
+        try:
+            return _check_feasible(
+                detections, subset, w_dist, w_app, penalty,
+                min(check_time_limit, remaining),
+            )
+        except LocationIncomplete as exc:
+            raise LocationIncomplete(f"第 {checks} 次可行性检查超时或出错：{exc}") from exc
+
+    try:
+        if feasible(judgments):
+            return {
+                "status": "feasible",
+                "checks": checks,
+                "message": "当前判断组合本身可行，未发现可定位的判断冲突。",
+            }
+
+        # 删除法：逐条尝试去掉；去后仍不可行则永久去掉。
+        current = list(range(len(judgments)))
+        for idx in range(len(judgments)):
+            if idx not in current:
+                continue
+            trial = [i for i in current if i != idx]
+            if not feasible([judgments[i] for i in trial]):
+                current = trial
+
+        group = [judgments[i] for i in current]
+
+        # 显式复核交付给用户的保证：组本身不可行，且去掉任意一条即可行。
+        if feasible(group):
+            raise LocationIncomplete("复核冲突组时结果不一致（组本身反而可行），未给出冲突判断。")
+        for idx in current:
+            trial = [judgments[i] for i in current if i != idx]
+            if not feasible(trial):
+                raise LocationIncomplete(
+                    "复核冲突组时结果不一致（并非最小冲突组），未给出冲突判断。"
+                )
+    except LocationIncomplete as exc:
+        return {
+            "status": "incomplete",
+            "checks": checks,
+            "message": f"冲突定位未完成：{exc} 不猜测冲突判断。",
+        }
+    except Exception as exc:  # noqa: BLE001 - 任何异常都不能变成猜测
+        return {
+            "status": "incomplete",
+            "checks": checks,
+            "message": f"冲突定位未完成：定位过程出错（{exc}）。不猜测冲突判断。",
+        }
+
+    return {
+        "status": "found",
+        "checks": checks,
+        "judgments": group,
+        "message": (
+            f"已定位 {len(group)} 条冲突判断：单独这组即使轨迹不可行；"
+            "删除其中任意一条，轨迹即可行。"
+        ),
     }

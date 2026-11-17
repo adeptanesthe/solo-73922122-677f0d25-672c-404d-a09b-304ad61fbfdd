@@ -20,6 +20,12 @@ const state = {
   result: null,           // 当前展示的求解结果
   jobId: null,
   pollTimer: null,
+  locateJobId: null,      // 冲突定位任务
+  locateTimer: null,
+  locateRunning: false,
+  conflict: null,         // {pairKeys:Set<string>, judgments:[...], checks:int}
+  locateMessage: null,    // {text, tone}
+  limitJudgments: 8,      // 会话下发的定位条数上限
 };
 
 const $ = (id) => document.getElementById(id);
@@ -72,7 +78,14 @@ function loadSession(payload) {
   state.selection = [];
   state.result = null;
   state.jobId = null;
+  state.locateJobId = null;
+  state.locateRunning = false;
+  state.conflict = null;
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+  if (state.locateTimer) { clearTimeout(state.locateTimer); state.locateTimer = null; }
+  if (payload.limits && payload.limits.location_judgments) {
+    state.limitJudgments = payload.limits.location_judgments;
+  }
 
   state.images = [];
   for (let i = 0; i < state.nFrames; i++) {
@@ -244,7 +257,7 @@ async function setJudgment(type) {
   const key = pairKey(a, b);
   const rest = state.judgments.filter((j) => pairKey(j.a, j.b) !== key);
   const next = type ? [...rest, { a, b, type }] : rest;
-  invalidateResult(); // 修改即撤下旧结果
+  invalidateResult(); // 修改即撤下旧结果与冲突标记
   try {
     const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
       method: "PUT",
@@ -281,6 +294,10 @@ async function removeJudgment(a, b) {
   }
 }
 
+function isConflictJudgment(j) {
+  return !!state.conflict && state.conflict.pairKeys.has(pairKey(j.a, j.b));
+}
+
 function renderJudgments() {
   const ul = $("judgment-list");
   ul.innerHTML = "";
@@ -294,12 +311,21 @@ function renderJudgments() {
     tag.textContent = j.type === "same" ? "同只" : "异只";
     const text = document.createElement("span");
     text.textContent = `帧${da ? da.frame : "?"} #${j.a} ↔ 帧${db ? db.frame : "?"} #${j.b}`;
+    li.append(tag, text);
+    if (isConflictJudgment(j)) {
+      li.classList.add("conflict");
+      const mark = document.createElement("span");
+      mark.className = "conflict-mark";
+      mark.textContent = "⚑ 冲突组";
+      li.append(mark);
+    }
     const del = document.createElement("button");
     del.textContent = "删除";
     del.onclick = () => removeJudgment(j.a, j.b);
-    li.append(tag, text, del);
+    li.append(del);
     ul.appendChild(li);
   }
+  renderConflictPanel();
 }
 
 /* ------------------------------------------------------------ 参数 */
@@ -330,6 +356,8 @@ async function applyParams() {
 /* ------------------------------------------------------------ 求解 */
 
 function invalidateResult() {
+  // 输入一改，旧结果与旧冲突标记都必须撤下
+  clearConflict();
   if (state.result !== null) {
     state.result = null;
     const banner = $("result-banner");
@@ -339,6 +367,166 @@ function invalidateResult() {
     $("trajectory-list").innerHTML = "";
     draw();
   }
+  renderConflictPanel();
+}
+
+/* ------------------------------------------------------------ 冲突定位 */
+
+function clearConflict() {
+  state.conflict = null;
+  state.locateMessage = null;
+  if (state.locateTimer) { clearTimeout(state.locateTimer); state.locateTimer = null; }
+  state.locateJobId = null;
+  state.locateRunning = false;
+}
+
+function setLocateMessage(text, tone) {
+  state.locateMessage = text ? { text, tone: tone || "muted" } : null;
+}
+
+function renderConflictPanel() {
+  const panel = $("conflict-panel");
+  const hint = $("conflict-hint");
+  const status = $("conflict-status");
+  const btn = $("locate-btn");
+  const group = $("conflict-group");
+  const n = state.judgments.length;
+  const overLimit = n > state.limitJudgments;
+  const infeasible = !!(
+    state.result && state.result.feasible === false && state.result.reason === "infeasible"
+  );
+  const show = overLimit || infeasible || !!state.conflict || state.locateRunning ||
+    !!state.locateMessage;
+  panel.hidden = !show;
+  if (!show) {
+    hint.textContent = "";
+    status.textContent = "";
+    group.innerHTML = "";
+    btn.hidden = true;
+    return;
+  }
+
+  group.innerHTML = "";
+  if (state.conflict) {
+    for (const j of state.conflict.judgments) {
+      const da = detById(j.a);
+      const db = detById(j.b);
+      const li = document.createElement("li");
+      const tag = document.createElement("span");
+      tag.className = `tag ${j.type === "same" ? "same" : "diff"}`;
+      tag.textContent = j.type === "same" ? "同只" : "异只";
+      const text = document.createElement("span");
+      text.textContent =
+        `帧${da ? da.frame : "?"} #${j.a} ↔ 帧${db ? db.frame : "?"} #${j.b}`;
+      li.append(tag, text);
+      group.appendChild(li);
+    }
+  }
+
+  if (overLimit) {
+    hint.textContent =
+      `当前 ${n} 条判断，超过 ${state.limitJudgments} 条，暂不提供冲突定位；仍可正常求解。`;
+    btn.hidden = true;
+  } else if (infeasible) {
+    hint.textContent = state.locateRunning
+      ? "正在逐条检查判断组合的可行性…"
+      : `当前已确认无解。点击定位，返回一组单独即可导致不可行的判断` +
+        `（删去其中任意一条即可行）。`;
+    btn.hidden = false;
+    btn.disabled = state.locateRunning;
+  } else {
+    hint.textContent = state.conflict
+      ? "已定位的冲突判断如下；改判其中任意一条后，旧标记会自动撤下。"
+      : "";
+    btn.hidden = true;
+  }
+  const msg = state.locateMessage;
+  status.textContent = msg ? msg.text : "";
+  status.style.color =
+    msg && msg.tone === "err" ? "#ff9d97"
+      : msg && msg.tone === "warn" ? "#ffd887"
+        : "";
+}
+
+async function locateConflict() {
+  if (!state.sessionId || state.locateRunning) return;
+  setLocateMessage("正在启动冲突定位…");
+  renderConflictPanel();
+  try {
+    const resp = await api(`/api/sessions/${state.sessionId}/locate-conflict`, {
+      method: "POST",
+    });
+    if (resp.status === "too_many") {
+      setLocateMessage(resp.message, "warn");
+      renderConflictPanel();
+      return;
+    }
+    state.locateJobId = resp.job_id;
+    state.locateRunning = true;
+    setLocateMessage(`检查中（输入版本 v${resp.version}）…`);
+    renderConflictPanel();
+    pollLocate(resp.job_id, resp.version);
+  } catch (err) {
+    state.locateRunning = false;
+    setLocateMessage(`冲突定位未完成：${err.message} 不猜测冲突判断。`, "err");
+    renderConflictPanel();
+  }
+}
+
+async function pollLocate(jobId, version) {
+  try {
+    const job = await api(`/api/jobs/${jobId}`);
+    if (jobId !== state.locateJobId) return; // 已被更新的定位任务取代
+    if (job.status === "running") {
+      state.locateTimer = setTimeout(() => pollLocate(jobId, version), 400);
+      return;
+    }
+    state.locateRunning = false;
+    if (job.status === "error") {
+      setLocateMessage(
+        `冲突定位未完成：${job.error || "定位任务失败"}。不猜测冲突判断。`, "err");
+      renderConflictPanel();
+      return;
+    }
+    if (job.version !== state.version) {
+      setLocateMessage(
+        `定位完成，但其基于旧输入（v${job.version}，当前 v${state.version}），` +
+        "结果已作废；未标记任何判断，请重新定位。", "warn");
+      renderConflictPanel();
+      return;
+    }
+    const r = job.result || {};
+    if (r.status === "found") {
+      state.conflict = {
+        pairKeys: new Set(
+          (r.pair_keys && r.pair_keys.length)
+            ? r.pair_keys
+            : r.judgments.map((j) => pairKey(j.a, j.b))
+        ),
+        judgments: r.judgments,
+        checks: r.checks,
+      };
+      setLocateMessage(
+        `${r.message}（共 ${r.checks} 次可行性检查）`, "err");
+    } else if (r.status === "incomplete") {
+      state.conflict = null;
+      setLocateMessage(r.message || "冲突定位未完成：可行性检查超时或出错。不猜测冲突判断。", "err");
+    } else if (r.status === "too_many") {
+      state.conflict = null;
+      setLocateMessage(r.message, "warn");
+    } else if (r.status === "feasible") {
+      state.conflict = null;
+      setLocateMessage(r.message || "当前判断组合可行，未发现冲突。", "warn");
+    } else {
+      state.conflict = null;
+      setLocateMessage("冲突定位未完成：返回了无法识别的结果。不猜测冲突判断。", "err");
+    }
+    renderJudgments();
+  } catch (err) {
+    state.locateRunning = false;
+    setLocateMessage(`冲突定位未完成：${err.message} 不猜测冲突判断。`, "err");
+    renderConflictPanel();
+  }
 }
 
 async function solve() {
@@ -346,6 +534,7 @@ async function solve() {
   const status = $("solve-status");
   status.classList.add("muted");
   status.style.color = "";
+  setLocateMessage(null);
   try {
     const resp = await api(`/api/sessions/${state.sessionId}/solve`, { method: "POST" });
     state.jobId = resp.job_id;
@@ -385,6 +574,8 @@ async function pollJob(jobId) {
     status.style.color = "";
     state.result = job.result;
     renderResult();
+    renderJudgments();
+    renderConflictPanel();
     draw();
   } catch (err) {
     showError("solve-status", err);
@@ -397,10 +588,20 @@ function renderResult() {
   const list = $("trajectory-list");
   const r = state.result;
   if (!r) return;
+  if (r.feasible) {
+    // 可行结果意味着旧的冲突标记已不成立
+    state.conflict = null;
+    setLocateMessage(null);
+  }
   if (!r.feasible) {
+    const known = r.reason === "infeasible" || (r.message || "").startsWith("无解");
     banner.className = "banner err";
-    banner.textContent = `无解：${r.message || "约束冲突。"}`;
-    summary.innerHTML = "<b>不提供动物计数。</b>";
+    banner.textContent = known
+      ? (r.message || "无解：约束冲突。")
+      : `未得到结果：${r.message || "求解失败。"}`;
+    summary.innerHTML = known
+      ? "<b>不提供动物计数。</b>"
+      : "<b>本次未得到可用结果，不提供动物计数。</b>";
     list.innerHTML = "";
     return;
   }
@@ -441,6 +642,7 @@ function renderAll() {
   banner.textContent = "尚无结果。";
   $("result-summary").innerHTML = "";
   $("trajectory-list").innerHTML = "";
+  renderConflictPanel();
 }
 
 /* ------------------------------------------------------------ 事件绑定 */
@@ -453,6 +655,7 @@ $("mark-same").addEventListener("click", () => setJudgment("same"));
 $("mark-diff").addEventListener("click", () => setJudgment("different"));
 $("mark-clear").addEventListener("click", () => setJudgment(null));
 $("solve-btn").addEventListener("click", solve);
+$("locate-btn").addEventListener("click", locateConflict);
 canvas.addEventListener("click", onCanvasClick);
 for (const id of ["p-wdist", "p-wapp", "p-penalty"]) {
   $(id).addEventListener("change", applyParams);

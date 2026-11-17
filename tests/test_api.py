@@ -141,7 +141,147 @@ def test_same_judgment_changes_result():
     assert len(same_traj) == 1
 
 
-# ---------------------------------------------------------------- 版本与迟到结果
+# ---------------------------------------------------------------- 冲突定位
+
+def wait_locate(sid, timeout=15.0):
+    """启动定位并等待结果。"""
+    resp = client.post(f"/api/sessions/{sid}/locate-conflict")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    if body.get("status") == "too_many":
+        return body
+    job = wait_job(body["job_id"], timeout=timeout)
+    assert job["status"] == "done", job
+    return job["result"]
+
+
+def test_locate_conflict_returns_minimal_group():
+    p = client.post("/api/example").json()
+    sid = p["session_id"]
+    judgments = [
+        {"a": "A0", "b": "B0", "type": "same"},   # 同帧同只，冲突
+        {"a": "A1", "b": "A2", "type": "same"},   # 无关判断，不得混入
+    ]
+    client.put(f"/api/sessions/{sid}/judgments", json={"judgments": judgments})
+    solved = wait_job(client.post(f"/api/sessions/{sid}/solve").json()["job_id"])
+    assert solved["result"]["feasible"] is False
+    assert solved["result"]["reason"] == "infeasible"
+
+    res = wait_locate(sid)
+    assert res["status"] == "found", res
+    keys = {(j["a"], j["b"], j["type"]) for j in res["judgments"]}
+    assert keys == {("A0", "B0", "same")}
+    assert res["pair_keys"] == ["A0||B0"]
+
+    # 删除该组后应恢复可行
+    client.put(f"/api/sessions/{sid}/judgments", json={"judgments": []})
+    ok = wait_job(client.post(f"/api/sessions/{sid}/solve").json()["job_id"])
+    assert ok["result"]["feasible"] is True and ok["result"]["animal_count"] == 2
+
+
+def test_locate_conflict_transitive_group_and_removal_guarantee():
+    p = client.post("/api/example").json()
+    sid = p["session_id"]
+    judgments = [
+        {"a": "A0", "b": "A1", "type": "same"},
+        {"a": "A1", "b": "A2", "type": "same"},
+        {"a": "A0", "b": "A2", "type": "different"},
+        {"a": "B1", "b": "B2", "type": "same"},
+    ]
+    client.put(f"/api/sessions/{sid}/judgments", json={"judgments": judgments})
+    res = wait_locate(sid)
+    assert res["status"] == "found", res
+    group = res["judgments"]
+    assert len(group) == 3, group
+    assert all(g in judgments for g in group)
+
+    # 组内任意一条删去后，单独用剩余判断必须是可行解
+    for i in range(len(group)):
+        trial = [j for j in group if j is not group[i]]
+        client.put(f"/api/sessions/{sid}/judgments", json={"judgments": trial})
+        done = wait_job(client.post(f"/api/sessions/{sid}/solve").json()["job_id"])
+        assert done["result"]["feasible"] is True, (i, trial, done["result"])
+
+
+def test_locate_conflict_over_limit_returns_hint_without_job():
+    p = client.post("/api/example").json()
+    sid = p["session_id"]
+    base = [{"a": "A0", "b": "A1", "type": "same"},
+            {"a": "A1", "b": "A2", "type": "same"},
+            {"a": "A2", "b": "A3", "type": "same"},
+            {"a": "A3", "b": "A4", "type": "same"},
+            {"a": "A4", "b": "A5", "type": "same"},
+            {"a": "B0", "b": "B1", "type": "same"},
+            {"a": "B1", "b": "B2", "type": "same"},
+            {"a": "B2", "b": "B4", "type": "same"},
+            {"a": "B4", "b": "B5", "type": "same"}]
+    assert len(base) == 9
+    client.put(f"/api/sessions/{sid}/judgments", json={"judgments": base})
+    resp = client.post(f"/api/sessions/{sid}/locate-conflict")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "too_many" and body["job_id"] is None
+    assert "8" in body["message"] and "仍可正常求解" in body["message"]
+
+    # 超过上限仍可正常求解（这些判断本身不冲突）
+    done = wait_job(client.post(f"/api/sessions/{sid}/solve").json()["job_id"])
+    assert done["status"] == "done"
+    assert done["result"]["feasible"] is True
+    assert done["result"]["animal_count"] == 2
+
+
+def test_locate_conflict_feasible_input():
+    p = client.post("/api/example").json()
+    sid = p["session_id"]
+    client.put(f"/api/sessions/{sid}/judgments",
+               json={"judgments": [{"a": "A0", "b": "A1", "type": "same"}]})
+    res = wait_locate(sid)
+    assert res["status"] == "feasible"
+    assert "judgments" not in res
+
+
+def test_locate_conflict_job_version_tracks_input():
+    p = client.post("/api/example").json()
+    sid = p["session_id"]
+    client.put(f"/api/sessions/{sid}/judgments",
+               json={"judgments": [{"a": "A0", "b": "B0", "type": "same"}]})
+    resp = client.post(f"/api/sessions/{sid}/locate-conflict").json()
+    assert resp["version"] == 2
+    # 定位期间改判 → 任务仍是旧版本，前端据此丢弃
+    client.put(f"/api/sessions/{sid}/judgments", json={"judgments": []})
+    job = wait_job(resp["job_id"])
+    assert job["version"] == 2
+    current = client.get(f"/api/sessions/{sid}").json()
+    assert current["version"] == 3
+
+
+def test_locate_conflict_unknown_session_404():
+    assert client.post("/api/sessions/nope/locate-conflict").status_code == 404
+
+
+def test_locate_conflict_solver_error_reports_incomplete(monkeypatch):
+    """任一次可行性检查出错 → 明确提示定位未完成，不返回冲突组。"""
+    import app.solver as solver_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated check failure")
+
+    p = client.post("/api/example").json()
+    sid = p["session_id"]
+    client.put(f"/api/sessions/{sid}/judgments",
+               json={"judgments": [{"a": "A0", "b": "B0", "type": "same"}]})
+    monkeypatch.setattr(solver_mod, "_run_milp", boom)
+    res = wait_locate(sid)
+    assert res["status"] == "incomplete"
+    assert "judgments" not in res and "pair_keys" not in res
+    assert "未完成" in res["message"]
+
+
+def test_limits_expose_location_cap():
+    p = make_session()
+    assert p["limits"]["location_judgments"] == 8
+
+
 
 def test_version_bumps_and_stale_job_detectable():
     p = make_session()

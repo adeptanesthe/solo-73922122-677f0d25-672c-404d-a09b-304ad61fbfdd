@@ -21,7 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .example import EXAMPLE_DESCRIPTION, build_example_detections, build_example_frames
-from .solver import InputConflict, solve_tracking
+from .solver import MAX_LOCATE_JUDGMENTS, InputConflict, locate_conflict, solve_tracking
 
 MAX_FRAMES = 10
 MAX_DETECTIONS = 30
@@ -147,7 +147,11 @@ def _payload(sess: dict) -> dict:
         "detections": sess["detections"],
         "judgments": sess["judgments"],
         "params": sess["params"],
-        "limits": {"frames": MAX_FRAMES, "detections": MAX_DETECTIONS},
+        "limits": {
+            "frames": MAX_FRAMES,
+            "detections": MAX_DETECTIONS,
+            "location_judgments": MAX_LOCATE_JUDGMENTS,
+        },
     }
 
 
@@ -279,7 +283,11 @@ def _run_job(job_id: str, snapshot: dict):
     except InputConflict as exc:
         JOBS[job_id].update(
             status="done",
-            result={"feasible": False, "message": f"无解：{exc} 不提供动物计数。"},
+            result={
+                "feasible": False,
+                "reason": "infeasible",
+                "message": f"无解：{exc} 不提供动物计数。",
+            },
         )
     except Exception as exc:  # noqa: BLE001 - 任何求解异常都不能拖垮服务
         JOBS[job_id].update(status="error", error=f"求解内部错误：{exc}")
@@ -307,6 +315,99 @@ async def get_job(job_id: str):
     if job is None:
         _err(404, "求解任务不存在。")
     return job
+
+
+# ---------------------------------------------------------------- 冲突定位
+
+def _judgments_by_index(snapshot: dict):
+    """把按框号记录的判断转换为求解器使用的下标形式。"""
+    id_to_idx = {d["id"]: i for i, d in enumerate(snapshot["detections"])}
+    return [
+        {"a": id_to_idx[j["a"]], "b": id_to_idx[j["b"]], "type": j["type"]}
+        for j in snapshot["judgments"]
+    ]
+
+
+def _run_locate_job(job_id: str, snapshot: dict):
+    try:
+        idx_judgments = _judgments_by_index(snapshot)
+        if len(idx_judgments) > MAX_LOCATE_JUDGMENTS:
+            result = {
+                "status": "too_many",
+                "message": (
+                    f"当前有 {len(idx_judgments)} 条判断，超过 {MAX_LOCATE_JUDGMENTS} 条，"
+                    "暂不提供冲突定位；仍可正常求解。"
+                ),
+                "limit": MAX_LOCATE_JUDGMENTS,
+            }
+        else:
+            located = locate_conflict(
+                snapshot["detections"],
+                idx_judgments,
+                snapshot["params"]["w_dist"],
+                snapshot["params"]["w_app"],
+                snapshot["params"]["penalty"],
+            )
+            result = dict(located)
+            ids = [str(d["id"]) for d in snapshot["detections"]]
+            if result.get("status") == "found":
+                # 转回框号，并保留具体判断内容供界面标注
+                group = [
+                    {
+                        "a": ids[j["a"]],
+                        "b": ids[j["b"]],
+                        "type": j["type"],
+                    }
+                    for j in result["judgments"]
+                ]
+                result["judgments"] = group
+                result["pair_keys"] = sorted(
+                    _pair_key(j["a"], j["b"]) for j in group
+                )
+        JOBS[job_id].update(status="done", result=result)
+    except Exception as exc:  # noqa: BLE001 - 定位异常不拖垮服务，也不猜测冲突
+        JOBS[job_id].update(
+            status="done",
+            result={
+                "status": "incomplete",
+                "message": f"冲突定位未完成：定位过程出错（{exc}）。不猜测冲突判断。",
+            },
+        )
+
+
+def _pair_key(a: str, b: str) -> str:
+    return "||".join(sorted((str(a), str(b))))
+
+
+@app.post("/api/sessions/{sid}/locate-conflict")
+async def start_locate(sid: str):
+    """对当前判断做冲突定位（异步任务，前端轮询）。
+
+    仅当判断条数不超过上限时才实际定位；超过时返回 ``too_many`` 提示，不影响求解。
+    定位使用的输入快照与任务版本号，便于前端丢弃迟到结果。
+    """
+    sess = _get_session(sid)
+    if len(sess["judgments"]) > MAX_LOCATE_JUDGMENTS:
+        return {
+            "job_id": None,
+            "version": sess["version"],
+            "status": "too_many",
+            "limit": MAX_LOCATE_JUDGMENTS,
+            "message": (
+                f"当前有 {len(sess['judgments'])} 条判断，超过 {MAX_LOCATE_JUDGMENTS} 条，"
+                "暂不提供冲突定位；仍可正常求解。"
+            ),
+        }
+    job_id = uuid.uuid4().hex[:12]
+    snapshot = {
+        "detections": copy.deepcopy(sess["detections"]),
+        "judgments": copy.deepcopy(sess["judgments"]),
+        "params": dict(sess["params"]),
+    }
+    JOBS[job_id] = {"status": "running", "version": sess["version"], "result": None, "error": None}
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(EXECUTOR, _run_locate_job, job_id, snapshot)
+    return {"job_id": job_id, "version": sess["version"], "status": "running"}
 
 
 # ---------------------------------------------------------------- 页面
